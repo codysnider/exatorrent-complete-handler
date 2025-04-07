@@ -11,7 +11,8 @@ Built as a lightweight, zero-dependency scratch container using Go.
   - Locates the completed files at /data/torrents/{infohash}
   - Recursively copies them to /data/complete/{infohash}
 
-🚀 Usage with Docker Compose
+## Usage with Docker Compose
+
 ```yaml
 version: "3.8"
 
