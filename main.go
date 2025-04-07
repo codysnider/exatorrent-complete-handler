@@ -23,7 +23,20 @@ type CompleteRequest struct {
 	Time     time.Time `json:"time"`
 }
 
+var (
+	jobQueue = make(chan copyJob, 100)
+)
+
+type copyJob struct {
+	Req      CompleteRequest
+	SrcDir   string
+	DstDir   string
+	RespChan chan<- string
+}
+
 func main() {
+	go processCopyJobs()
+
 	http.HandleFunc("/complete", completeHandler)
 	fmt.Println("Listening on :8080")
 	_ = http.ListenAndServe(":8080", nil)
@@ -50,30 +63,59 @@ func completeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Torrent completed: %s (%s)", req.Name, req.Metainfo)
-	log.Printf("Completion time: %s", req.Time.Format(time.RFC3339))
-	log.Printf("State: %s", req.State)
-
 	srcDir := filepath.Join(sourceBase, req.Metainfo)
 	dstDir := filepath.Join(destinationBase, req.Metainfo)
 
-	log.Printf("Source path: %s", srcDir)
-	log.Printf("Destination path: %s", dstDir)
+	respChan := make(chan string, 1)
 
-	if err := copyDir(srcDir, dstDir); err != nil {
-		http.Error(w, fmt.Sprintf("Copy error: %v", err), http.StatusInternalServerError)
-		log.Printf("Copy failed: %v", err)
-		return
+	job := copyJob{
+		Req:      req,
+		SrcDir:   srcDir,
+		DstDir:   dstDir,
+		RespChan: respChan,
 	}
 
-	log.Printf("Copy succeeded for hash %s", req.Metainfo)
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("Copied successfully"))
+	select {
+	case jobQueue <- job:
+		log.Printf("Queued copy job for %s", req.Metainfo)
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte("Job queued"))
+	default:
+		http.Error(w, "Server busy, try again later", http.StatusServiceUnavailable)
+		log.Printf("Queue full, dropping job for %s", req.Metainfo)
+	}
+}
+
+func processCopyJobs() {
+	for job := range jobQueue {
+		log.Printf("Starting copy job for %s", job.Req.Metainfo)
+
+		// Skip if destination already exists
+		if _, err := os.Stat(job.DstDir); err == nil {
+			log.Printf("Destination already exists for hash %s, skipping", job.Req.Metainfo)
+			job.RespChan <- "Already exists, skipping"
+			continue
+		} else if !os.IsNotExist(err) {
+			log.Printf("Error checking destination: %v", err)
+			job.RespChan <- fmt.Sprintf("Error: %v", err)
+			continue
+		}
+
+		if err := copyDir(job.SrcDir, job.DstDir); err != nil {
+			log.Printf("Copy failed for %s: %v", job.Req.Metainfo, err)
+			job.RespChan <- fmt.Sprintf("Copy failed: %v", err)
+			continue
+		}
+
+		log.Printf("Copy succeeded for hash %s", job.Req.Metainfo)
+		job.RespChan <- "Copied successfully"
+	}
 }
 
 func copyDir(src, dst string) error {
 	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
+			log.Printf("[walk error] %v", err)
 			return err
 		}
 
@@ -81,27 +123,32 @@ func copyDir(src, dst string) error {
 		targetPath := filepath.Join(dst, relPath)
 
 		if info.IsDir() {
+			log.Printf("Creating directory: %s", targetPath)
 			return os.MkdirAll(targetPath, info.Mode())
 		}
 
-		// Copy file
+		log.Printf("Copying file: %s -> %s", path, targetPath)
+
 		srcFile, err := os.Open(path)
 		if err != nil {
+			log.Printf("Error opening source file %s: %v", path, err)
 			return err
 		}
-		defer func(srcFile *os.File) {
-			_ = srcFile.Close()
-		}(srcFile)
+		defer srcFile.Close()
 
 		dstFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode())
 		if err != nil {
+			log.Printf("Error creating destination file %s: %v", targetPath, err)
 			return err
 		}
-		defer func(dstFile *os.File) {
-			_ = dstFile.Close()
-		}(dstFile)
+		defer dstFile.Close()
 
-		_, err = io.Copy(dstFile, srcFile)
-		return err
+		if _, err := io.Copy(dstFile, srcFile); err != nil {
+			log.Printf("Copy failed for %s: %v", path, err)
+			return err
+		}
+
+		log.Printf("Copied: %s", targetPath)
+		return nil
 	})
 }
