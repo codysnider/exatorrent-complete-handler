@@ -14,8 +14,6 @@ Built as a lightweight, zero-dependency scratch container using Go.
 ## Usage with Docker Compose
 
 ```yaml
-version: "3.8"
-
 services:
   exatorrent:
     image: ghcr.io/varbhat/exatorrent:latest
